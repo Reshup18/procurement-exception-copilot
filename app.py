@@ -1,0 +1,240 @@
+import time
+import os
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+import streamlit as st
+from dotenv import load_dotenv
+
+from pydantic import BaseModel, Field
+from typing import List, Optional, TypedDict
+import chromadb
+from chromadb.utils import embedding_functions
+
+from langchain_groq import ChatGroq
+from langchain_core.output_parsers import PydanticOutputParser
+from langgraph.graph import StateGraph, START, END
+
+# Load environment variables
+load_dotenv()
+api_key = os.getenv("GROQ_API_KEY")
+
+# --- 1. Schemas Definition ---
+class InvoiceItem(BaseModel):
+    description: str = Field(description="Description of goods or services")
+    quantity: int = Field(description="Quantity purchased")
+    unit_price: float = Field(description="Unit price per item")
+    line_total: float = Field(description="Total line item price")
+
+class InvoiceSchema(BaseModel):
+    vendor_name: str = Field(description="Name of vendor")
+    po_number: Optional[str] = Field(None, description="PO number")
+    invoice_date: str = Field(description="Issue date")
+    invoice_total: float = Field(description="Final total amount")
+    has_tax_id: bool = Field(description="True if Tax ID is present")
+    payment_terms: str = Field(default="Net-30", description="Payment terms")
+    line_items: List[InvoiceItem] = Field(default_factory=list, description="Item list")
+
+class AuditResult(BaseModel):
+    is_compliant: bool = Field(description="True if compliant")
+    flagged_violations: List[str] = Field(default_factory=list, description="Policy violations")
+    risk_score: str = Field(description="LOW, MEDIUM, or HIGH risk")
+
+class ActionPayload(BaseModel):
+    recommended_action: str = Field(description="AUTO_APPROVE, FLAG_FOR_REVIEW, REJECT")
+    email_draft: str = Field(description="Drafted response email")
+    ticket_summary: str = Field(description="Ticket summary")
+
+# --- 2. Parsers & Vector Store Setup ---
+extraction_parser = PydanticOutputParser(pydantic_object=InvoiceSchema)
+audit_parser = PydanticOutputParser(pydantic_object=AuditResult)
+action_parser = PydanticOutputParser(pydantic_object=ActionPayload)
+
+class PolicyVectorStore:
+    def __init__(self, persistence_dir: str = "./chroma_db"):
+        self.chroma_client = chromadb.PersistentClient(path=persistence_dir)
+        self.emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        self.collection = self.chroma_client.get_or_create_collection(
+            name="procurement_policies",
+            embedding_function=self.emb_fn
+        )
+
+    def query_policy(self, query_text: str, n_results: int = 2) -> list[str]:
+        results = self.collection.query(
+            query_texts=[query_text],
+            n_results=n_results
+        )
+        return results["documents"][0] if results["documents"] else []
+
+# --- 3. Initialize LLM & Vector Store ---
+selected_model = "openai/gpt-oss-20b"
+llm = ChatGroq(
+    model_name=selected_model,
+    groq_api_key=api_key,
+    temperature=0.0
+)
+vector_store = PolicyVectorStore()
+
+# --- 4. Pipeline State & Agent Nodes ---
+class CopilotState(TypedDict):
+    raw_invoice_text: str
+    po_limit: float
+    extracted_invoice: InvoiceSchema
+    audit_report: AuditResult
+    final_action: ActionPayload
+
+def extraction_agent(state: CopilotState) -> dict:
+    prompt = f"""
+You are a precision data extraction system. Extract billing details from raw invoice text below.
+
+{extraction_parser.get_format_instructions()}
+
+Invoice Text:
+{state['raw_invoice_text']}
+"""
+    raw_response = llm.invoke(prompt)
+    extracted_data = extraction_parser.parse(raw_response.content)
+    return {"extracted_invoice": extracted_data}
+
+def policy_audit_agent(state: CopilotState) -> dict:
+    inv = state["extracted_invoice"]
+    po_limit = state.get("po_limit", inv.invoice_total)
+
+    retrieved_policies = vector_store.query_policy(
+        f"Invoice total {inv.invoice_total} vs PO limit {po_limit}, tax ID rules, payment terms {inv.payment_terms}"
+    )
+    context_str = "\n---\n".join(retrieved_policies)
+
+    prompt = f"""
+You are an automated procurement compliance auditor. Compare invoice details against policy rules.
+
+{audit_parser.get_format_instructions()}
+
+Relevant Procurement Policies:
+{context_str}
+
+Extracted Invoice Details:
+- Vendor: {inv.vendor_name}
+- Invoice Total: ${inv.invoice_total:.2f}
+- PO Expected Limit: ${po_limit:.2f}
+- Tax ID Present: {inv.has_tax_id}
+- Payment Terms: {inv.payment_terms}
+
+Determine compliance, highlight rule violations, and assign a risk level.
+"""
+    raw_response = llm.invoke(prompt)
+    audit_res = audit_parser.parse(raw_response.content)
+    return {"audit_report": audit_res}
+
+def action_agent(state: CopilotState) -> dict:
+    inv = state["extracted_invoice"]
+    audit = state["audit_report"]
+
+    prompt = f"""
+You are a procurement resolution officer. Generate an operational action payload and vendor response email.
+
+{action_parser.get_format_instructions()}
+
+Invoice Summary:
+- Vendor: {inv.vendor_name}
+- Total: ${inv.invoice_total:.2f}
+    
+Audit Report:
+- Compliant: {audit.is_compliant}
+- Risk Level: {audit.risk_score}
+- Violations: {', '.join(audit.flagged_violations) if audit.flagged_violations else 'None'}
+
+Instructions:
+1. Set recommended_action to AUTO_APPROVE if compliant, else FLAG_FOR_REVIEW.
+2. Draft a clear, polite professional resolution email addressing discrepancies.
+3. Provide a concise single-sentence internal ticket summary.
+"""
+    raw_response = llm.invoke(prompt)
+    action_res = action_parser.parse(raw_response.content)
+    return {"final_action": action_res}
+
+# Compile LangGraph Workflow
+workflow = StateGraph(CopilotState)
+workflow.add_node("ExtractionAgent", extraction_agent)
+workflow.add_node("PolicyAuditAgent", policy_audit_agent)
+workflow.add_node("ActionAgent", action_agent)
+
+workflow.add_edge(START, "ExtractionAgent")
+workflow.add_edge("ExtractionAgent", "PolicyAuditAgent")
+workflow.add_edge("PolicyAuditAgent", "ActionAgent")
+workflow.add_edge("ActionAgent", END)
+
+copilot_app = workflow.compile()
+
+# --- 5. Streamlit User Interface Layout ---
+st.set_page_config(page_title="Procurement Exception Copilot", page_icon="🤖", layout="wide")
+
+st.title("🤖 Multi-Agent Procurement Exception Copilot")
+st.caption("Automated Invoice Extraction, RAG Policy Audit & Human-in-the-Loop Review")
+
+# Sidebar Configuration
+st.sidebar.header("Execution Controls")
+po_limit_input = st.sidebar.number_input("Expected PO Limit ($)", value=2000.0, step=100.0)
+
+sample_invoice_default = """INVOICE #INV-9082
+Vendor: Apex Tech Solutions
+Date: 2026-03-12
+PO Number: PO-8831
+
+Items Purchased:
+1. Enterprise Cloud Subscription (Qty: 1) - $2,250.00
+Tax ID / GSTIN: Not Provided
+Payment Terms: Immediate
+
+Total Amount Due: $2,250.00
+"""
+
+raw_text = st.text_area("Raw Invoice / Vendor Email Input", value=sample_invoice_default, height=220)
+
+if st.button("Run Multi-Agent Audit", type="primary"):
+    start_time = time.perf_counter()
+    
+    with st.spinner("Agents processing (Extraction -> Audit -> Action)..."):
+        inputs = {
+            "raw_invoice_text": raw_text,
+            "po_limit": float(po_limit_input)
+        }
+        result = copilot_app.invoke(inputs)
+    
+    elapsed_time = time.perf_counter() - start_time
+    st.success(f"Multi-Agent Pipeline executed in {elapsed_time:.2f} seconds!")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("1. Extracted Invoice Details")
+        inv = result["extracted_invoice"]
+        st.json(inv.model_dump())
+
+        st.subheader("2. Compliance Audit Findings")
+        audit = result["audit_report"]
+        if audit.is_compliant:
+            st.success(f"Status: COMPLIANT | Risk Level: {audit.risk_score}")
+        else:
+            st.error(f"Status: NON-COMPLIANT | Risk Level: {audit.risk_score}")
+            st.write("**Violations Flagged:**")
+            for v in audit.flagged_violations:
+                st.write(f"- {v}")
+
+    with col2:
+        st.subheader("3. Human-in-the-Loop Operator Review")
+        action = result["final_action"]
+        
+        st.selectbox("Recommended Action", ["AUTO_APPROVE", "FLAG_FOR_REVIEW", "REJECT"], 
+                     index=0 if action.recommended_action == "AUTO_APPROVE" else 1)
+        
+        st.text_input("Internal Ticket Summary", value=action.ticket_summary)
+        
+        edited_email = st.text_area("Resolution Email Draft (Editable)", value=action.email_draft, height=220)
+        
+        b1, b2 = st.columns(2)
+        if b1.button("Approve & Send Email"):
+            st.balloons()
+            st.success("Action logged & resolution email dispatched!")
+        if b2.button("Override / Reject Ticket"):
+            st.warning("Ticket rejected & escalated to manual queue.")
