@@ -1,0 +1,27 @@
+[
+    {
+        "case_id": "CASE-001",
+        "raw_text": "INVOICE #INV-2026-001\nVendor: Acme Supplies Ltd\nPO Reference: PO-90482\nDate: 2026-09-12\nTax ID: TX-99201\nSubtotal: $5,500.00\nTax: $550.00\nInvoice Total: $6,050.00\nBank Account: GB99HDFC11112222333344",
+        "po_record": {
+            "po_number": "PO-90482",
+            "po_total": 5000.0,
+            "approved_bank_account": "GB82WEST12345678901234"
+        },
+        "expected_exceptions": [
+            "POL_VAR_01",
+            "POL_BNK_03"
+        ]
+    },
+    {
+        "case_id": "CASE-002",
+        "raw_text": "INVOICE #INV-2026-002\nVendor: Global Tech Services\nPO Reference: PO-10294\nDate: 2026-09-14\nTax ID: UNKNOWN\nSubtotal: $2,000.00\nTax: $200.00\nInvoice Total: $2,200.00\nBank Account: GB11BARC98765432109876",
+        "po_record": {
+            "po_number": "PO-10294",
+            "po_total": 2200.0,
+            "approved_bank_account": "GB11BARC98765432109876"
+        },
+        "expected_exceptions": [
+            "POL_TAX_02"
+        ]
+    }
+]
