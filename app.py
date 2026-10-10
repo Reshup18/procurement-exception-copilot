@@ -239,8 +239,8 @@ if os.path.exists(json_path):
         with open(json_path, "r") as f:
             cases_list = json.load(f)
             for idx, case in enumerate(cases_list):
-                vendor = case.get("vendor_name", case.get("vendor", f"Vendor {idx+1}"))
-                po = case.get("po_number", "No PO")
+                vendor = case.get("vendor_name") or case.get("vendor") or case.get("supplier") or f"Vendor {idx+1}"
+                po = case.get("po_number") or case.get("po_reference") or case.get("po") or "No PO"
                 case_title = f"Case {idx + 1}: {vendor} ({po})"
                 
                 # Extract text content
