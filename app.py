@@ -231,7 +231,7 @@ Total Amount Due: $2,250.00"""
 # DYNAMIC CASE SELECTION DROPDOWN (LOADS FROM JSON)
 # ------------------------------------------------------------------------------
 cases_dict = {}
-json_path = os.path.join("data", "procurement_cases.json")
+json_path = "procurement_cases.json"
 
 # Check if data/procurement_cases.json exists and load cases dynamically
 if os.path.exists(json_path):
